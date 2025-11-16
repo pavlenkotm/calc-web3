@@ -35,6 +35,7 @@ contract SnakeCalculator {
         Position[] body;
         Position apple;
         uint256 score;
+        uint8 calculationStreak;
         bool active;
     }
 
@@ -71,6 +72,7 @@ contract SnakeCalculator {
         game.height = height;
         game.direction = Direction.Right;
         game.score = 0;
+        game.calculationStreak = 0;
         game.active = true;
 
         uint8 centerX = width / 2;
@@ -125,6 +127,7 @@ contract SnakeCalculator {
         (alive, newHead, ateApple) = _step(game);
         if (!alive) {
             game.active = false;
+            game.calculationStreak = 0;
             emit GameOver(msg.sender, game.score);
         } else {
             emit GameUpdated(msg.sender, newHead, ateApple, game.score);
@@ -139,9 +142,15 @@ contract SnakeCalculator {
         SnakeGame storage game = games[msg.sender];
         uint256 bonus;
         if (game.active && result != 0) {
+            if (game.calculationStreak < type(uint8).max) {
+                game.calculationStreak++;
+            }
+            uint256 streakBonus = uint256(game.calculationStreak) / 3; // +1 every 3 consecutive hits
             uint256 magnitude = uint256(_abs(result));
-            bonus = (magnitude % 5) + 1; // 1 to 5 extra points
+            bonus = (magnitude % 5) + 1 + streakBonus; // 1 to 5 extra points plus streak bonus
             game.score += bonus;
+        } else {
+            game.calculationStreak = 0;
         }
 
         emit CalculatorUsed(msg.sender, op, left, right, result, bonus);
@@ -150,6 +159,36 @@ contract SnakeCalculator {
     /// @notice Pure calculator helper when you are not interested in the snake boosts.
     function calculate(int256 left, int256 right, Operation op) external pure returns (int256) {
         return _calculate(left, right, op);
+    }
+
+    /// @notice Simulates the next move without mutating the chain state to help frontends plan safer paths.
+    /// @return alive Whether the snake would survive.
+    /// @return newHead Hypothetical head position after the move.
+    /// @return ateApple Whether the apple would be consumed.
+    /// @return prospectiveScore Score after the step if executed on-chain.
+    function previewMove(address player, Direction desiredDirection)
+        external
+        view
+        returns (bool alive, Position memory newHead, bool ateApple, uint256 prospectiveScore)
+    {
+        SnakeGame storage gameStorage = games[player];
+        if (!gameStorage.active) {
+            return (false, Position(0, 0), false, gameStorage.score);
+        }
+
+        SnakeGame memory game = _cloneGame(gameStorage);
+        if (!_isOpposite(game.direction, desiredDirection)) {
+            game.direction = desiredDirection;
+        }
+
+        (alive, newHead, ateApple) = _simulateStep(game);
+        prospectiveScore = game.score + (ateApple ? 1 : 0);
+    }
+
+    /// @notice Provides lightweight stats to power UI streak indicators.
+    function getScoreStats(address player) external view returns (uint256 score, uint8 calculationStreak) {
+        SnakeGame storage game = games[player];
+        return (game.score, game.calculationStreak);
     }
 
     function _step(SnakeGame storage game) private returns (bool alive, Position memory newHead, bool ateApple) {
@@ -229,6 +268,21 @@ contract SnakeCalculator {
         return candidate;
     }
 
+    function _cloneGame(SnakeGame storage game) private view returns (SnakeGame memory clone) {
+        clone.width = game.width;
+        clone.height = game.height;
+        clone.direction = game.direction;
+        clone.apple = game.apple;
+        clone.score = game.score;
+        clone.calculationStreak = game.calculationStreak;
+        clone.active = game.active;
+
+        clone.body = new Position[](game.body.length);
+        for (uint256 i = 0; i < game.body.length; i++) {
+            clone.body[i] = game.body[i];
+        }
+    }
+
     function _calculate(int256 left, int256 right, Operation op) private pure returns (int256) {
         if (op == Operation.Add) {
             return left + right;
@@ -242,6 +296,41 @@ contract SnakeCalculator {
             revert("Division by zero");
         }
         return left / right;
+    }
+
+    function _simulateStep(SnakeGame memory game)
+        private
+        pure
+        returns (bool alive, Position memory newHead, bool ateApple)
+    {
+        if (game.body.length == 0) {
+            revert EmptySnake();
+        }
+
+        Position memory head = game.body[game.body.length - 1];
+        newHead = head;
+        if (game.direction == Direction.Up) {
+            if (head.y == 0) return (false, newHead, false);
+            newHead.y -= 1;
+        } else if (game.direction == Direction.Down) {
+            if (head.y + 1 >= game.height) return (false, newHead, false);
+            newHead.y += 1;
+        } else if (game.direction == Direction.Left) {
+            if (head.x == 0) return (false, newHead, false);
+            newHead.x -= 1;
+        } else {
+            if (head.x + 1 >= game.width) return (false, newHead, false);
+            newHead.x += 1;
+        }
+
+        for (uint256 i = 0; i < game.body.length; i++) {
+            if (game.body[i].x == newHead.x && game.body[i].y == newHead.y) {
+                return (false, newHead, false);
+            }
+        }
+
+        alive = true;
+        ateApple = (newHead.x == game.apple.x && newHead.y == game.apple.y);
     }
 
     function _isOpposite(Direction a, Direction b) private pure returns (bool) {
